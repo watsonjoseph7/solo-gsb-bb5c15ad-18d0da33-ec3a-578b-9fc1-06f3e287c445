@@ -50,6 +50,15 @@
   th { background: #f0f2f5; font-weight: 600; }
   tbody tr:nth-child(even) { background: #fafbfc; }
   tbody tr:hover { background: #eef4ff; }
+  .section-title { font-size: 18px; margin: 32px 0 4px; }
+  .beat-bar label { font-size: 14px; color: #57606a; display: flex; align-items: center; gap: 6px; }
+  .beat-bar input {
+    width: 130px; padding: 7px 10px; font-size: 14px;
+    border: 1px solid #d0d7de; border-radius: 8px; background: #fff;
+  }
+  .beat-bar input:focus { outline: 2px solid #0969da33; border-color: #0969da; }
+  #beatSummary { font-size: 14px; color: #1a7f37; margin: 0 0 10px; font-weight: 600; }
+  td.center, th.center { text-align: center; }
 </style>
 </head>
 <body>
@@ -78,6 +87,24 @@
     </thead>
     <tbody></tbody>
   </table>
+
+  <h2 class="section-title">节拍点查询</h2>
+  <p class="hint">
+    输入起止毫秒（左闭右开），列出该时间窗内每拍的时间、演奏序号、原小节号、拍序与首拍标记。
+    是否落窗按未取整的累计时间判断，展示时间四舍五入到最近毫秒；窗内超过 5000 拍时停止并指出源行。
+  </p>
+  <div class="toolbar beat-bar">
+    <label>起 <input id="beatStart" type="number" min="0" step="1" placeholder="如 500"></label>
+    <label>止 <input id="beatEnd" type="number" min="0" step="1" placeholder="如 2000"></label>
+    <button id="beatBtn" class="primary">查询拍点</button>
+  </div>
+  <p id="beatSummary"></p>
+  <table id="beatResult" hidden>
+    <thead>
+      <tr><th>时间(毫秒)</th><th>演奏序号</th><th>原小节号</th><th>拍序</th><th class="center">首拍</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
 </div>
 
 <script>
@@ -91,6 +118,9 @@ $("exampleBtn").addEventListener("click", () => {
   doExpand();
 });
 $("csvBtn").addEventListener("click", downloadCsv);
+$("beatBtn").addEventListener("click", queryBeats);
+$("beatStart").addEventListener("keydown", (e) => { if (e.key === "Enter") queryBeats(); });
+$("beatEnd").addEventListener("keydown", (e) => { if (e.key === "Enter") queryBeats(); });
 
 function reset() {
   $("errors").innerHTML = "";
@@ -99,6 +129,13 @@ function reset() {
   $("result").querySelector("tbody").innerHTML = "";
   $("csvBtn").disabled = true;
   lastRows = [];
+  resetBeats();
+}
+
+function resetBeats() {
+  $("beatSummary").textContent = "";
+  $("beatResult").hidden = true;
+  $("beatResult").querySelector("tbody").innerHTML = "";
 }
 
 async function doExpand() {
@@ -136,6 +173,64 @@ async function doExpand() {
   tbody.appendChild(frag);
   $("result").hidden = false;
   $("csvBtn").disabled = false;
+}
+
+async function queryBeats() {
+  $("errors").innerHTML = "";
+  resetBeats();
+  const startRaw = $("beatStart").value.trim();
+  const endRaw = $("beatEnd").value.trim();
+  if (!startRaw || !endRaw) {
+    showErrors([{ line: null, message: "请输入起始与结束毫秒" }]);
+    return;
+  }
+  const start = Number(startRaw);
+  const end = Number(endRaw);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0) {
+    showErrors([{ line: null, message: "起止时间必须为非负整数毫秒" }]);
+    return;
+  }
+  if (end <= start) {
+    showErrors([{ line: null, message: "结束时间必须晚于起始时间（时间窗左闭右开）" }]);
+    return;
+  }
+
+  let data;
+  try {
+    const resp = await fetch("/api/beats", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ input: $("input").value, start_ms: start, end_ms: end }),
+    });
+    data = await resp.json();
+  } catch (e) {
+    showErrors([{ line: null, message: "请求失败：" + e }]);
+    return;
+  }
+  if (!data.ok) {
+    showErrors(data.errors || []);
+    return;
+  }
+
+  $("beatSummary").textContent =
+    `查询成功，[${data.start_ms}, ${data.end_ms}) 内共 ${data.count} 拍`;
+  const tbody = $("beatResult").querySelector("tbody");
+  const frag = document.createDocumentFragment();
+  for (const b of data.beats) {
+    const tr = document.createElement("tr");
+    for (const v of [b.time_ms, b.seq, b.num, b.beat]) {
+      const td = document.createElement("td");
+      td.textContent = v;
+      tr.appendChild(td);
+    }
+    const td = document.createElement("td");
+    td.className = "center";
+    td.textContent = b.downbeat ? "● 首拍" : "";
+    tr.appendChild(td);
+    frag.appendChild(tr);
+  }
+  tbody.appendChild(frag);
+  $("beatResult").hidden = false;
 }
 
 function showErrors(errors) {

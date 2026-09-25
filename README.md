@@ -2,18 +2,30 @@
 
 供排练使用的 Web 应用：逐行输入小节编号与反复记号，自动校验并展开为实际演奏顺序，
 页面展示演奏序号、原小节编号、源行号和每次演奏的起止时间（毫秒），并可下载同内容的 CSV。
+此外可按起止毫秒查询时间窗内的节拍点：每拍的时间、演奏序号、原小节号、拍序及首拍标记。
 
-## 启动
+## 启动（单条命令）
 
 ```bash
-docker compose up --build
+docker compose up --build -d
 ```
 
-容器启动时会自动安装依赖（`pip install -r requirements.txt`）并启动应用。
+容器在构建后的启动阶段自动安装依赖（`pip install -r requirements.txt`）并启动应用；
+加 `-d` 在后台运行，查看日志用 `docker compose logs -f`，停止用 `docker compose down`。
 
-## 访问
+## 访问（5000 端口）
 
-浏览器打开 <http://localhost:5000>
+- 网页界面：<http://localhost:5000>
+- 展开接口：`POST http://localhost:5000/api/expand`
+- 节拍点查询接口：`POST http://localhost:5000/api/beats`
+
+接口示例：
+
+```bash
+curl -s http://localhost:5000/api/beats \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "1[4@120]\n2\n", "start_ms": 0, "end_ms": 2000}'
+```
 
 ## 配置
 
@@ -55,6 +67,28 @@ docker compose up --build
 结果中每个小节的起止时间单位为毫秒，累计时保留完整精度，输出时四舍五入到最近毫秒。
 上例前 10 个演奏小节为 120 BPM，第 11 个（小节 7）起切换为 90 BPM，总时长 47000 毫秒。
 
+## 节拍点查询
+
+在网页“节拍点查询”区输入起止毫秒（或调用 `POST /api/beats`，参数
+`{"input": 乐谱文本, "start_ms": 起, "end_ms": 止}`），即可列出时间窗内的每一拍：
+
+| 字段 | 说明 |
+| ---- | ---- |
+| 时间 | 拍点所在毫秒，按现有规则四舍五入到最近毫秒 |
+| 演奏序号 | 该拍所属小节是第几次实际演奏（反复演奏分别计数） |
+| 原小节号 | 乐谱上的小节编号 |
+| 拍序 | 小节内第几拍（1 起） |
+| 首拍 | 拍序为 1 时标记为首拍 |
+
+查询规则：
+
+- 时间窗按**左闭右开** `[start_ms, end_ms)` 处理；是否落窗用**未取整**的累计时间判断，
+  展示时间再四舍五入到最近毫秒
+- 反复回跳后，未标 BPM 的小节沿用上一实际演奏小节的速度
+- 查询按小节跨度直接跳过窗外小节，不逐拍展开；时间窗内拍点超过 **5000** 拍时停止，
+  并指出导致超限的源行（小节），避免大量反复或超长小节耗尽服务资源
+- 展开小节数同样受 5000 小节上限保护，超限时指出对应源行
+
 ## 校验规则
 
 - 格式错误：定位到具体输入行
@@ -62,6 +96,8 @@ docker compose up --build
 - 小节编号必须唯一，重复时指出首次出现的行号
 - `|:` 与 `:|xN` 必须配对，未配对时定位到对应行
 - 展开超过 5000 小节时停止，并指出导致超限的源行
+- 节拍点查询：起止时间必须为非负整数毫秒且结束晚于起始（左闭右开）；
+  时间窗内拍点超过 5000 个时停止，并指出导致超限的源行
 
 ## 本地开发（不使用 Docker）
 
@@ -73,9 +109,9 @@ python app.py
 ## 项目结构
 
 ```
-app.py               Flask 应用与 API
-repeats.py           反复段解析、校验、展开与排练时间轴计算
-templates/index.html 前端页面（原生 HTML/JavaScript）
+app.py               Flask 应用与 API（展开 /api/expand、节拍点查询 /api/beats）
+repeats.py           反复段解析、校验、展开、排练时间轴与节拍点查询
+templates/index.html 前端页面（原生 HTML/JavaScript，含展开、CSV 下载与拍点查询）
 requirements.txt     Python 依赖
 Dockerfile           镜像构建（依赖随容器启动安装）
 docker-compose.yml   Compose 编排

@@ -15,6 +15,12 @@ import re
 # 展开小节数上限
 MAX_MEASURES = 5000
 
+# 单次时间窗查询返回的拍点数上限
+MAX_BEATS = 5000
+
+# 拍点落窗判断时吸收累计浮点误差的容差（毫秒，仅用于吸附数学上相等的边界）
+_EPS_MS = 1e-6
+
 # 默认拍数与初始速度
 DEFAULT_BEATS = 4
 INITIAL_BPM = 120
@@ -140,18 +146,19 @@ def parse(text):
     return root, errors
 
 
-def expand(root, limit=MAX_MEASURES):
-    """按嵌套层级展开为实际演奏顺序（迭代实现，避免深嵌套递归溢出）。
+def _iter_played(root, measure_limit=MAX_MEASURES):
+    """按嵌套层级依次产出实际演奏到的小节（迭代实现，避免深嵌套递归溢出）。
 
-    返回 (rows, overflow)：
-    - rows     为 [{"seq": 演奏序号, "num": 原小节编号, "line": 源行号,
-                     "start_ms": 起始毫秒, "end_ms": 结束毫秒}, ...]；
-      时长按 拍数×60/BPM 秒累计，累计时保留精度，起止毫秒四舍五入到最近毫秒
-    - overflow 为导致超过 limit 的小节节点；未超限时为 None
+    每个产出为 (小节节点, 起始精确毫秒, 时长精确毫秒, 本小节实际速度)。
+    速度沿用上一实际演奏小节：带速度标记的小节每次演奏到时先切换速度，
+    未标速度则沿用当前速度（初始 120 BPM）。
+    当累计演奏小节数超过 measure_limit 时，生成器以导致超限的小节节点为
+    返回值结束（迭代结束时通过 StopIteration.value 获取）。
     """
-    rows = []
     bpm = INITIAL_BPM  # 当前速度，初始 120 BPM
     elapsed = 0.0  # 已累计的演奏时长（毫秒，保留精度）
+    count = 0
+    overflow = None
     # 帧结构：[子节点列表, 下一个待处理下标, 剩余重复次数]
     stack = [[root["children"], 0, 1]]
     while stack:
@@ -172,16 +179,113 @@ def expand(root, limit=MAX_MEASURES):
             if node["bpm"] is not None:
                 bpm = node["bpm"]
             duration = node["beats"] * 60000 / bpm
-            rows.append({
-                "seq": len(rows) + 1,
-                "num": node["num"],
-                "line": node["line"],
-                "start_ms": _round_ms(elapsed),
-                "end_ms": _round_ms(elapsed + duration),
-            })
+            yield node, elapsed, duration, bpm
             elapsed += duration
-            if len(rows) > limit:
-                return rows, node
+            count += 1
+            if count > measure_limit:
+                overflow = node
+                break
         else:
             stack.append([node["children"], 0, node["count"]])
-    return rows, None
+    return overflow
+
+
+def expand(root, limit=MAX_MEASURES):
+    """按嵌套层级展开为实际演奏顺序。
+
+    返回 (rows, overflow)：
+    - rows     为 [{"seq": 演奏序号, "num": 原小节编号, "line": 源行号,
+                     "start_ms": 起始毫秒, "end_ms": 结束毫秒}, ...]；
+      时长按 拍数×60/BPM 秒累计，累计时保留精度，起止毫秒四舍五入到最近毫秒
+    - overflow 为导致超过 limit 的小节节点；未超限时为 None
+    """
+    rows = []
+    gen = _iter_played(root, limit)
+    while True:
+        try:
+            node, elapsed, duration, _bpm = next(gen)
+        except StopIteration as exc:
+            overflow = exc.value
+            break
+        rows.append({
+            "seq": len(rows) + 1,
+            "num": node["num"],
+            "line": node["line"],
+            "start_ms": _round_ms(elapsed),
+            "end_ms": _round_ms(elapsed + duration),
+        })
+    return rows, overflow
+
+
+def _beat_index_below(position, measure_start, beat_dur, n_beats):
+    """返回满足 小节起点 + j*拍长 < position 的最大拍下标 j（0 起）。
+
+    数学上等于拍点位置时按容差吸附（吸收累计浮点误差）；结果裁到 [-1, n_beats-1]，
+    返回 -1 表示小节内没有拍点严格早于 position。
+    """
+    offset = position - measure_start
+    raw = offset / beat_dur
+    nearest = round(raw)
+    if -1 <= nearest <= n_beats and abs(offset - nearest * beat_dur) <= _EPS_MS:
+        idx = nearest - 1  # 该拍点与 position 相等（左闭右开不含），取前一拍
+    else:
+        idx = math.ceil(raw) - 1
+    return max(-1, min(n_beats - 1, idx))
+
+
+def query_beats(root, start_ms, end_ms,
+                measure_limit=MAX_MEASURES, beat_limit=MAX_BEATS):
+    """查询左闭右开时间窗 [start_ms, end_ms) 内的拍点。
+
+    用未取整的累计时间判断拍点是否落窗；按小节跨度直接跳过窗外小节，
+    不逐拍展开。返回 (beats, overflow)：
+    - beats 为 [{"time_ms": 展示毫秒, "time": 精确毫秒, "seq": 演奏序号,
+                 "num": 原小节编号, "line": 源行号, "beat": 拍序,
+                 "downbeat": 是否首拍}, ...]
+    - overflow 为 None，或 {"kind": "measures"|"beats", "node": 小节节点}，
+      分别表示演奏小节数超限或窗内拍点数超限，node 为导致停止的小节节点
+    """
+    beats = []
+    seq = 0  # 实际演奏小节序号（每次经过一个小节加一，含窗外小节）
+    gen = _iter_played(root, measure_limit)
+    while True:
+        try:
+            node, m_start, duration, bpm = next(gen)
+        except StopIteration as exc:
+            if exc.value is not None:
+                return beats, {"kind": "measures", "node": exc.value}
+            break
+        seq += 1
+
+        m_end = m_start + duration
+        # 整节在窗口之前：跳过；整节在窗口之后（起点已到/越过窗右端）：后续无需再看
+        if m_end <= start_ms + _EPS_MS:
+            continue
+        if m_start >= end_ms - _EPS_MS:
+            break
+
+        n_beats = node["beats"]
+        beat_dur = 60000 / bpm
+        # 拍点（0 基下标 j）位于 m_start + j*beat_dur；左闭取 t>=start 的最小 j，
+        # 右开取 t<end 的最大 j，数学上等于边界时按容差吸附
+        j_lo = _beat_index_below(start_ms, m_start, beat_dur, n_beats) + 1
+        j_hi = _beat_index_below(end_ms, m_start, beat_dur, n_beats)
+        too_many = False
+        for j in range(j_lo, j_hi + 1):
+            t = m_start + j * beat_dur
+            beats.append({
+                "time_ms": _round_ms(t),
+                "time": t,
+                "seq": seq,
+                "num": node["num"],
+                "line": node["line"],
+                "beat": j + 1,
+                "downbeat": j == 0,
+            })
+            # 小节内也可能包含海量拍点（超长小节），必须在拍循环内即时停止
+            if len(beats) > beat_limit:
+                too_many = True
+                break
+        if too_many:
+            return beats, {"kind": "beats", "node": node}
+    return beats, None
