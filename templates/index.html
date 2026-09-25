@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>乐谱反复段展开工具</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    background: #f5f6f8;
+    color: #24292f;
+  }
+  .container { max-width: 860px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 8px 0 4px; }
+  .hint { color: #57606a; font-size: 14px; line-height: 1.7; margin: 8px 0 16px; }
+  .hint code {
+    background: #eaeef2; border-radius: 4px; padding: 1px 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  textarea {
+    width: 100%; padding: 10px 12px; font-size: 15px; line-height: 1.6;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    border: 1px solid #d0d7de; border-radius: 8px; resize: vertical;
+    background: #fff;
+  }
+  textarea:focus { outline: 2px solid #0969da33; border-color: #0969da; }
+  .toolbar { display: flex; gap: 8px; margin: 12px 0 16px; flex-wrap: wrap; }
+  button {
+    padding: 8px 18px; font-size: 14px; border: 1px solid #d0d7de;
+    border-radius: 8px; background: #fff; cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: #f0f2f5; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  button.primary:hover:not(:disabled) { background: #1a5fd0; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #errors ul {
+    margin: 0 0 16px; padding: 12px 16px 12px 32px;
+    background: #ffebe9; border: 1px solid #ffb3ad; border-radius: 8px;
+    color: #a40e26; font-size: 14px; line-height: 1.8;
+  }
+  #summary { font-size: 14px; color: #1a7f37; margin: 0 0 10px; font-weight: 600; }
+  table {
+    width: 100%; border-collapse: collapse; background: #fff;
+    border: 1px solid #d0d7de; border-radius: 8px; overflow: hidden;
+    font-size: 14px;
+  }
+  th, td { padding: 7px 14px; text-align: right; border-bottom: 1px solid #eaeef2; }
+  th { background: #f0f2f5; font-weight: 600; }
+  tbody tr:nth-child(even) { background: #fafbfc; }
+  tbody tr:hover { background: #eef4ff; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>乐谱反复段展开工具</h1>
+  <p class="hint">
+    每行输入一个小节编号；编号前加 <code>|:</code> 表示反复起点，编号后加
+    <code>:|xN</code>（N 为 2~9）表示反复终点，反复段可嵌套。
+    行末可附 <code>[拍数@BPM]</code> 或 <code>[拍数]</code>：拍数默认 4，初始速度
+    120 BPM，未标速度的小节沿用上一演奏小节的速度；起止时间单位为毫秒。
+    展开结果超过 5000 小节时将停止并指出导致超限的源行。
+  </p>
+  <textarea id="input" rows="12" spellcheck="false"
+    placeholder="例如：&#10;1[4@120]&#10;2&#10;|:3&#10;4[2]&#10;|:5&#10;6:|x3&#10;7:|x2[4@90]&#10;8"></textarea>
+  <div class="toolbar">
+    <button id="expandBtn" class="primary">展开</button>
+    <button id="exampleBtn">填入示例</button>
+    <button id="clearBtn">清空</button>
+    <button id="csvBtn" disabled>下载 CSV</button>
+  </div>
+  <div id="errors"></div>
+  <p id="summary"></p>
+  <table id="result" hidden>
+    <thead>
+      <tr><th>演奏序号</th><th>原小节编号</th><th>源行号</th><th>起始时间(毫秒)</th><th>结束时间(毫秒)</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let lastRows = [];
+
+$("expandBtn").addEventListener("click", doExpand);
+$("clearBtn").addEventListener("click", () => { $("input").value = ""; reset(); $("input").focus(); });
+$("exampleBtn").addEventListener("click", () => {
+  $("input").value = ["1[4@120]", "2", "|:3", "4[2]", "|:5", "6:|x3", "7:|x2[4@90]", "8"].join("\n");
+  doExpand();
+});
+$("csvBtn").addEventListener("click", downloadCsv);
+
+function reset() {
+  $("errors").innerHTML = "";
+  $("summary").textContent = "";
+  $("result").hidden = true;
+  $("result").querySelector("tbody").innerHTML = "";
+  $("csvBtn").disabled = true;
+  lastRows = [];
+}
+
+async function doExpand() {
+  reset();
+  let data;
+  try {
+    const resp = await fetch("/api/expand", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ input: $("input").value }),
+    });
+    data = await resp.json();
+  } catch (e) {
+    showErrors([{ line: null, message: "请求失败：" + e }]);
+    return;
+  }
+  if (!data.ok) {
+    showErrors(data.errors || []);
+    return;
+  }
+  lastRows = data.rows;
+  const total = data.rows.length ? data.rows[data.rows.length - 1].end_ms : 0;
+  $("summary").textContent = `展开成功，共 ${data.count} 小节，总时长 ${total} 毫秒`;
+  const tbody = $("result").querySelector("tbody");
+  const frag = document.createDocumentFragment();
+  for (const r of data.rows) {
+    const tr = document.createElement("tr");
+    for (const v of [r.seq, r.num, r.line, r.start_ms, r.end_ms]) {
+      const td = document.createElement("td");
+      td.textContent = v;
+      tr.appendChild(td);
+    }
+    frag.appendChild(tr);
+  }
+  tbody.appendChild(frag);
+  $("result").hidden = false;
+  $("csvBtn").disabled = false;
+}
+
+function showErrors(errors) {
+  const ul = document.createElement("ul");
+  for (const e of errors) {
+    const li = document.createElement("li");
+    li.textContent = e.line ? `第 ${e.line} 行：${e.message}` : e.message;
+    ul.appendChild(li);
+  }
+  $("errors").appendChild(ul);
+}
+
+function downloadCsv() {
+  const lines = ["演奏序号,原小节编号,源行号,起始时间(毫秒),结束时间(毫秒)"];
+  for (const r of lastRows) lines.push(`${r.seq},${r.num},${r.line},${r.start_ms},${r.end_ms}`);
+  // 加 BOM 以便 Excel 正确识别 UTF-8 中文表头
+  const blob = new Blob(["﻿" + lines.join("\r\n") + "\r\n"],
+    { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "expanded_measures.csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+</script>
+</body>
+</html>
