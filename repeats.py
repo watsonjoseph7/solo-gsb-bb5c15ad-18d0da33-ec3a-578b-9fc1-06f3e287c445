@@ -15,6 +15,9 @@ import re
 # 展开小节数上限
 MAX_MEASURES = 5000
 
+# 时间窗内拍点数上限
+MAX_BEATS = 5000
+
 # 默认拍数与初始速度
 DEFAULT_BEATS = 4
 INITIAL_BPM = 120
@@ -140,18 +143,8 @@ def parse(text):
     return root, errors
 
 
-def expand(root, limit=MAX_MEASURES):
-    """按嵌套层级展开为实际演奏顺序（迭代实现，避免深嵌套递归溢出）。
-
-    返回 (rows, overflow)：
-    - rows     为 [{"seq": 演奏序号, "num": 原小节编号, "line": 源行号,
-                     "start_ms": 起始毫秒, "end_ms": 结束毫秒}, ...]；
-      时长按 拍数×60/BPM 秒累计，累计时保留精度，起止毫秒四舍五入到最近毫秒
-    - overflow 为导致超过 limit 的小节节点；未超限时为 None
-    """
-    rows = []
-    bpm = INITIAL_BPM  # 当前速度，初始 120 BPM
-    elapsed = 0.0  # 已累计的演奏时长（毫秒，保留精度）
+def _iter_measures(root):
+    """按实际演奏顺序迭代产生小节节点（迭代实现，避免深嵌套递归溢出）。"""
     # 帧结构：[子节点列表, 下一个待处理下标, 剩余重复次数]
     stack = [[root["children"], 0, 1]]
     while stack:
@@ -168,20 +161,87 @@ def expand(root, limit=MAX_MEASURES):
         node = children[idx]
         frame[1] += 1
         if node["type"] == "measure":
-            # 带速度标记的小节每次演奏到时先切换速度；未标速度则沿用当前速度
-            if node["bpm"] is not None:
-                bpm = node["bpm"]
-            duration = node["beats"] * 60000 / bpm
-            rows.append({
-                "seq": len(rows) + 1,
-                "num": node["num"],
-                "line": node["line"],
-                "start_ms": _round_ms(elapsed),
-                "end_ms": _round_ms(elapsed + duration),
-            })
-            elapsed += duration
-            if len(rows) > limit:
-                return rows, node
+            yield node
         else:
             stack.append([node["children"], 0, node["count"]])
+
+
+def expand(root, limit=MAX_MEASURES):
+    """按嵌套层级展开为实际演奏顺序。
+
+    返回 (rows, overflow)：
+    - rows     为 [{"seq": 演奏序号, "num": 原小节编号, "line": 源行号,
+                     "start_ms": 起始毫秒, "end_ms": 结束毫秒}, ...]；
+      时长按 拍数×60/BPM 秒累计，累计时保留精度，起止毫秒四舍五入到最近毫秒
+    - overflow 为导致超过 limit 的小节节点；未超限时为 None
+    """
+    rows = []
+    bpm = INITIAL_BPM  # 当前速度，初始 120 BPM
+    elapsed = 0.0  # 已累计的演奏时长（毫秒，保留精度）
+    for node in _iter_measures(root):
+        # 带速度标记的小节每次演奏到时先切换速度；未标速度则沿用当前速度
+        if node["bpm"] is not None:
+            bpm = node["bpm"]
+        duration = node["beats"] * 60000 / bpm
+        rows.append({
+            "seq": len(rows) + 1,
+            "num": node["num"],
+            "line": node["line"],
+            "start_ms": _round_ms(elapsed),
+            "end_ms": _round_ms(elapsed + duration),
+        })
+        elapsed += duration
+        if len(rows) > limit:
+            return rows, node
     return rows, None
+
+
+def beats_in_window(root, start_ms, end_ms,
+                    measure_limit=MAX_MEASURES, beat_limit=MAX_BEATS):
+    """列出时间窗 [start_ms, end_ms) 内的拍点（左闭右开）。
+
+    落窗判断使用未取整的累计时间，展示毫秒按 _round_ms 规则取整；
+    整小节在窗外时按小节跨度直接跳过，窗内拍点超过 beat_limit 时停止，
+    以免大量反复或长小节耗尽服务资源。
+
+    返回 (beats, overflow)：
+    - beats    为 [{"time_ms": 展示毫秒, "seq": 演奏序号, "num": 原小节编号,
+                     "beat": 拍序, "first": 是否首拍}, ...]
+    - overflow 为 None，或 {"kind": "measures" | "beats",
+                            "node": 导致停止的小节节点}
+    """
+    beats = []
+    bpm = INITIAL_BPM  # 当前速度；反复回跳后未标速度的小节沿用上一实际演奏小节
+    elapsed = 0.0  # 已累计的演奏时长（毫秒，保留精度）
+    seq = 0  # 演奏序号
+    for node in _iter_measures(root):
+        if node["bpm"] is not None:
+            bpm = node["bpm"]
+        seq += 1
+        beat_len = 60000 / bpm  # 每拍时长（毫秒）
+        duration = node["beats"] * beat_len
+        if elapsed >= end_ms:
+            break  # 时间轴单调前进，之后的拍点都在窗外
+        if seq > measure_limit:
+            return beats, {"kind": "measures", "node": node}
+        if elapsed + duration > start_ms:
+            # 小节跨度与时间窗相交：按等差定位首个可能落窗的拍，
+            # 避免逐拍扫过窗口之前的长小节
+            first_k = max(0, math.ceil((start_ms - elapsed) / beat_len) - 1)
+            for k in range(first_k, node["beats"]):
+                t = elapsed + k * beat_len
+                if t >= end_ms:
+                    break
+                if t >= start_ms:
+                    beats.append({
+                        "time_ms": _round_ms(t),
+                        "seq": seq,
+                        "num": node["num"],
+                        "beat": k + 1,
+                        "first": k == 0,
+                    })
+                    if len(beats) > beat_limit:
+                        return beats, {"kind": "beats", "node": node}
+        # 整小节在窗口之前时按小节跨度跳过，不逐拍展开
+        elapsed += duration
+    return beats, None

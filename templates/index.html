@@ -14,6 +14,7 @@
   }
   .container { max-width: 860px; margin: 0 auto; padding: 24px 16px 48px; }
   h1 { font-size: 22px; margin: 8px 0 4px; }
+  h2 { font-size: 17px; margin: 32px 0 4px; }
   .hint { color: #57606a; font-size: 14px; line-height: 1.7; margin: 8px 0 16px; }
   .hint code {
     background: #eaeef2; border-radius: 4px; padding: 1px 6px;
@@ -27,6 +28,11 @@
   }
   textarea:focus { outline: 2px solid #0969da33; border-color: #0969da; }
   .toolbar { display: flex; gap: 8px; margin: 12px 0 16px; flex-wrap: wrap; }
+  .toolbar input {
+    padding: 8px 12px; font-size: 14px; width: 150px;
+    border: 1px solid #d0d7de; border-radius: 8px; background: #fff;
+  }
+  .toolbar input:focus { outline: 2px solid #0969da33; border-color: #0969da; }
   button {
     padding: 8px 18px; font-size: 14px; border: 1px solid #d0d7de;
     border-radius: 8px; background: #fff; cursor: pointer;
@@ -40,7 +46,7 @@
     background: #ffebe9; border: 1px solid #ffb3ad; border-radius: 8px;
     color: #a40e26; font-size: 14px; line-height: 1.8;
   }
-  #summary { font-size: 14px; color: #1a7f37; margin: 0 0 10px; font-weight: 600; }
+  #summary, #beatSummary { font-size: 14px; color: #1a7f37; margin: 0 0 10px; font-weight: 600; }
   table {
     width: 100%; border-collapse: collapse; background: #fff;
     border: 1px solid #d0d7de; border-radius: 8px; overflow: hidden;
@@ -78,6 +84,25 @@
     </thead>
     <tbody></tbody>
   </table>
+
+  <h2>节拍点查询</h2>
+  <p class="hint">
+    输入起止毫秒，列出时间窗内每一拍的时间、演奏序号、原小节编号、拍序与首拍标记。
+    时间窗按左闭右开 <code>[起始, 结束)</code> 处理；落窗判断使用未取整的累计时间，
+    展示毫秒四舍五入到最近毫秒。窗内拍点超过 5000 时停止并指出对应源行。
+  </p>
+  <div class="toolbar">
+    <input id="startMs" type="number" min="0" step="any" placeholder="起始毫秒（含）">
+    <input id="endMs" type="number" min="0" step="any" placeholder="结束毫秒（不含）">
+    <button id="beatsBtn" class="primary">查询拍点</button>
+  </div>
+  <p id="beatSummary"></p>
+  <table id="beatResult" hidden>
+    <thead>
+      <tr><th>时间(毫秒)</th><th>演奏序号</th><th>原小节编号</th><th>拍序</th><th>首拍</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
 </div>
 
 <script>
@@ -91,14 +116,29 @@ $("exampleBtn").addEventListener("click", () => {
   doExpand();
 });
 $("csvBtn").addEventListener("click", downloadCsv);
+$("beatsBtn").addEventListener("click", doBeatQuery);
+for (const id of ["startMs", "endMs"]) {
+  $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") doBeatQuery(); });
+}
 
 function reset() {
   $("errors").innerHTML = "";
+  resetExpand();
+  resetBeats();
+}
+
+function resetExpand() {
   $("summary").textContent = "";
   $("result").hidden = true;
   $("result").querySelector("tbody").innerHTML = "";
   $("csvBtn").disabled = true;
   lastRows = [];
+}
+
+function resetBeats() {
+  $("beatSummary").textContent = "";
+  $("beatResult").hidden = true;
+  $("beatResult").querySelector("tbody").innerHTML = "";
 }
 
 async function doExpand() {
@@ -146,6 +186,53 @@ function showErrors(errors) {
     ul.appendChild(li);
   }
   $("errors").appendChild(ul);
+}
+
+async function doBeatQuery() {
+  $("errors").innerHTML = "";
+  resetBeats();
+  // 空值或非数字（NaN 经 JSON 序列化也为 null）交由服务端校验
+  const toNum = (id) => {
+    const v = $(id).value.trim();
+    return v === "" ? null : Number(v);
+  };
+  let data;
+  try {
+    const resp = await fetch("/api/beats", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        input: $("input").value,
+        start_ms: toNum("startMs"),
+        end_ms: toNum("endMs"),
+      }),
+    });
+    data = await resp.json();
+  } catch (e) {
+    showErrors([{ line: null, message: "请求失败：" + e }]);
+    return;
+  }
+  if (!data.ok) {
+    showErrors(data.errors || []);
+    return;
+  }
+  $("beatSummary").textContent = data.count
+    ? `时间窗内共 ${data.count} 拍`
+    : "时间窗内没有拍点";
+  if (!data.count) return;
+  const tbody = $("beatResult").querySelector("tbody");
+  const frag = document.createDocumentFragment();
+  for (const b of data.beats) {
+    const tr = document.createElement("tr");
+    for (const v of [b.time_ms, b.seq, b.num, b.beat, b.first ? "✓" : ""]) {
+      const td = document.createElement("td");
+      td.textContent = v;
+      tr.appendChild(td);
+    }
+    frag.appendChild(tr);
+  }
+  tbody.appendChild(frag);
+  $("beatResult").hidden = false;
 }
 
 function downloadCsv() {
